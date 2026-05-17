@@ -93,18 +93,30 @@ export class Thread {
       approvalPolicy: options?.approvalPolicy,
       additionalDirectories: options?.additionalDirectories,
     });
+    let pendingItem: string | null = null;
     try {
       for await (const item of generator) {
-        let parsed: ThreadEvent;
+        const candidate: string = pendingItem === null ? item : `${pendingItem}\\n${item}`;
+        let parsed: ThreadEvent | null;
         try {
-          parsed = JSON.parse(item) as ThreadEvent;
+          parsed = JSON.parse(candidate) as ThreadEvent;
         } catch (error) {
-          throw new Error(`Failed to parse item: ${item}`, { cause: error });
+          if (isUnterminatedJsonString(candidate)) {
+            pendingItem = candidate;
+            continue;
+          }
+          throw new Error(`Failed to parse item: ${candidate}`, { cause: error });
         }
+        pendingItem = null;
         if (parsed.type === "thread.started") {
           this._id = parsed.thread_id;
         }
         yield parsed;
+      }
+      if (pendingItem !== null) {
+        throw new Error(`Failed to parse item: ${pendingItem}`, {
+          cause: new Error("Unterminated JSON string in Codex exec output"),
+        });
       }
     } finally {
       await cleanup();
@@ -136,6 +148,28 @@ export class Thread {
     }
     return { items, finalResponse, usage };
   }
+}
+
+function isUnterminatedJsonString(value: string): boolean {
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      inString = !inString;
+    }
+  }
+
+  return inString;
 }
 
 function normalizeInput(input: Input): { prompt: string; images: string[] } {
