@@ -37,6 +37,8 @@ export type UserInput =
 
 export type Input = string | UserInput[];
 
+const MAX_PENDING_JSON_BYTES = 32 * 1024 * 1024;
+
 /** Represent a thread of conversation with the agent. One thread can have multiple consecutive turns. */
 export class Thread {
   private _exec: CodexExec;
@@ -102,6 +104,7 @@ export class Thread {
           parsed = JSON.parse(candidate) as ThreadEvent;
         } catch (error) {
           if (isUnterminatedJsonString(candidate)) {
+            assertPendingJsonWithinLimit(candidate);
             pendingItem = candidate;
             continue;
           }
@@ -147,6 +150,15 @@ export class Thread {
       throw new Error(turnFailure.message);
     }
     return { items, finalResponse, usage };
+  }
+}
+
+function assertPendingJsonWithinLimit(value: string): void {
+  const byteLength = Buffer.byteLength(value, "utf8");
+  if (byteLength > MAX_PENDING_JSON_BYTES) {
+    throw new Error(
+      `Failed to parse item: pending JSON event exceeded ${MAX_PENDING_JSON_BYTES} bytes while waiting for an unterminated JSON string to close (received ${byteLength} bytes)`,
+    );
   }
 }
 

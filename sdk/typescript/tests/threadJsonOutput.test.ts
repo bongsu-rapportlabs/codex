@@ -38,4 +38,23 @@ describe("Thread JSON output parsing", () => {
       },
     ]);
   });
+
+  it("fails instead of buffering an unterminated JSON string without bound", async () => {
+    const oversizedText = "x".repeat(33 * 1024 * 1024);
+    const exec = {
+      async *run() {
+        yield `{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"${oversizedText}`;
+      },
+    };
+    const thread = new Thread(exec as never, {}, {});
+
+    const streamed = await thread.runStreamed("inspect figma");
+    await expect(
+      (async () => {
+        for await (const event of streamed.events) {
+          expect(event).toBeDefined();
+        }
+      })(),
+    ).rejects.toThrow("pending JSON event exceeded");
+  });
 });
