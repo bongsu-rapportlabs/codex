@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
-import readline from "node:readline";
 import { createRequire } from "node:module";
+import { StringDecoder } from "node:string_decoder";
 
 import type { CodexConfigObject, CodexConfigValue } from "./codexOptions";
 import { SandboxMode, ModelReasoningEffort, ApprovalMode, WebSearchMode } from "./threadOptions";
@@ -42,6 +42,7 @@ export type CodexExecArgs = {
 const INTERNAL_ORIGINATOR_ENV = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
 const TYPESCRIPT_SDK_ORIGINATOR = "codex_sdk_ts";
 const CODEX_NPM_NAME = "@openai/codex";
+const MAX_PARTIAL_STDOUT_PREVIEW_BYTES = 4096;
 
 const PLATFORM_PACKAGE_BY_TARGET: Record<string, string> = {
   "x86_64-unknown-linux-musl": "@openai/codex-linux-x64",
@@ -196,15 +197,21 @@ export class CodexExec {
       },
     );
 
-    const rl = readline.createInterface({
-      input: child.stdout,
-      crlfDelay: Infinity,
-    });
+    const decoder = new StringDecoder("utf8");
+    let bufferedStdout = "";
 
     try {
-      for await (const line of rl) {
-        // `line` is a string (Node sets default encoding to utf8 for readline)
-        yield line as string;
+      for await (const chunk of child.stdout) {
+        bufferedStdout += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        let line: string | null;
+        while ((line = takeCompleteJsonlLine()) !== null) {
+          yield line;
+        }
+      }
+      bufferedStdout += decoder.end();
+      let line: string | null;
+      while ((line = takeCompleteJsonlLine()) !== null) {
+        yield line;
       }
 
       if (spawnError) throw spawnError;
@@ -212,10 +219,16 @@ export class CodexExec {
       if (code !== 0 || signal) {
         const stderrBuffer = Buffer.concat(stderrChunks);
         const detail = signal ? `signal ${signal}` : `code ${code ?? 1}`;
-        throw new Error(`Codex Exec exited with ${detail}: ${stderrBuffer.toString("utf8")}`);
+        const partialStdout = formatPartialStdoutPreview(bufferedStdout);
+        throw new Error(
+          `Codex Exec exited with ${detail}: ${stderrBuffer.toString("utf8")}${partialStdout}`,
+        );
+      }
+
+      if (bufferedStdout.length > 0) {
+        yield bufferedStdout;
       }
     } finally {
-      rl.close();
       child.removeAllListeners();
       try {
         if (!child.killed) child.kill();
@@ -223,7 +236,34 @@ export class CodexExec {
         // ignore
       }
     }
+
+    function takeCompleteJsonlLine(): string | null {
+      const newlineIndex = bufferedStdout.indexOf("\n");
+      if (newlineIndex === -1) {
+        return null;
+      }
+      let line = bufferedStdout.slice(0, newlineIndex);
+      if (line.endsWith("\r")) {
+        line = line.slice(0, -1);
+      }
+      bufferedStdout = bufferedStdout.slice(newlineIndex + 1);
+      return line;
+    }
   }
+}
+
+function formatPartialStdoutPreview(partialStdout: string): string {
+  if (partialStdout.length === 0) {
+    return "";
+  }
+  const bytes = Buffer.byteLength(partialStdout, "utf8");
+  let preview = partialStdout;
+  if (bytes > MAX_PARTIAL_STDOUT_PREVIEW_BYTES) {
+    preview = `${Buffer.from(partialStdout)
+      .subarray(0, MAX_PARTIAL_STDOUT_PREVIEW_BYTES)
+      .toString("utf8")}...`;
+  }
+  return `\nPartial stdout: ${preview}`;
 }
 
 function serializeConfigOverrides(configOverrides: CodexConfigObject): string[] {

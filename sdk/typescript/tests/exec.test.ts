@@ -68,6 +68,56 @@ describe("CodexExec", () => {
     }
   });
 
+  it("does not yield partial trailing stdout before checking a failed exit", async () => {
+    const { CodexExec } = await import("../src/exec");
+    const child = new FakeChildProcess();
+    spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
+
+    setImmediate(() => {
+      child.stdout.write('{"type":"item.completed","item":{"id":"item_0","type":"mcp_tool_call"');
+      child.stderr.write("boom");
+      child.emit("exit", 2, null);
+      setImmediate(() => {
+        child.stdout.end();
+        child.stderr.end();
+      });
+    });
+
+    const exec = new CodexExec("codex");
+    const lines: string[] = [];
+
+    await expect(
+      (async () => {
+        for await (const line of exec.run({ input: "hi" })) {
+          lines.push(line);
+        }
+      })(),
+    ).rejects.toThrow(/Codex Exec exited with code 2/);
+
+    expect(lines).toEqual([]);
+  });
+
+  it("still yields a successful final stdout line without a trailing newline", async () => {
+    const { CodexExec } = await import("../src/exec");
+    const child = new FakeChildProcess();
+    spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
+
+    setImmediate(() => {
+      child.stdout.write('{"type":"thread.started","thread_id":"thread-1"}');
+      child.stdout.end();
+      child.stderr.end();
+      child.emit("exit", 0, null);
+    });
+
+    const exec = new CodexExec("codex");
+    const lines: string[] = [];
+    for await (const line of exec.run({ input: "hi" })) {
+      lines.push(line);
+    }
+
+    expect(lines).toEqual(['{"type":"thread.started","thread_id":"thread-1"}']);
+  });
+
   it("places resume args before image args", async () => {
     const { CodexExec } = await import("../src/exec");
     spawnMock.mockClear();

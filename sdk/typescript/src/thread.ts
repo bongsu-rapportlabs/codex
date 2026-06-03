@@ -37,6 +37,8 @@ export type UserInput =
 
 export type Input = string | UserInput[];
 
+const MAX_PENDING_JSON_BYTES = 32 * 1024 * 1024;
+
 /** Represent a thread of conversation with the agent. One thread can have multiple consecutive turns. */
 export class Thread {
   private _exec: CodexExec;
@@ -93,18 +95,31 @@ export class Thread {
       approvalPolicy: options?.approvalPolicy,
       additionalDirectories: options?.additionalDirectories,
     });
+    let pendingItem: string | null = null;
     try {
       for await (const item of generator) {
+        const candidate: string = pendingItem === null ? item : `${pendingItem}\\n${item}`;
         let parsed: ThreadEvent;
         try {
-          parsed = JSON.parse(item) as ThreadEvent;
+          parsed = JSON.parse(candidate) as ThreadEvent;
         } catch (error) {
-          throw new Error(`Failed to parse item: ${item}`, { cause: error });
+          if (isUnterminatedJsonString(candidate)) {
+            assertPendingJsonWithinLimit(candidate);
+            pendingItem = candidate;
+            continue;
+          }
+          throw new Error(`Failed to parse item: ${candidate}`, { cause: error });
         }
+        pendingItem = null;
         if (parsed.type === "thread.started") {
           this._id = parsed.thread_id;
         }
         yield parsed;
+      }
+      if (pendingItem !== null) {
+        throw new Error(`Failed to parse item: ${pendingItem}`, {
+          cause: new Error("Unterminated JSON string in Codex exec output"),
+        });
       }
     } finally {
       await cleanup();
@@ -136,6 +151,37 @@ export class Thread {
     }
     return { items, finalResponse, usage };
   }
+}
+
+function assertPendingJsonWithinLimit(value: string): void {
+  const byteLength = Buffer.byteLength(value, "utf8");
+  if (byteLength > MAX_PENDING_JSON_BYTES) {
+    throw new Error(
+      `Failed to parse item: pending JSON event exceeded ${MAX_PENDING_JSON_BYTES} bytes while waiting for an unterminated JSON string to close (received ${byteLength} bytes)`,
+    );
+  }
+}
+
+function isUnterminatedJsonString(value: string): boolean {
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      inString = !inString;
+    }
+  }
+
+  return inString;
 }
 
 function normalizeInput(input: Input): { prompt: string; images: string[] } {
