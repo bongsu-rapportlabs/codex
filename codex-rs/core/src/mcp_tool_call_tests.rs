@@ -1007,6 +1007,11 @@ fn truncate_mcp_tool_result_for_event_bounds_large_result() {
     // bytes in the worst case. The extra buffer covers the small result wrapper
     // and marker.
     assert!(serialized.len() < MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES * 2 + 1024);
+    assert_eq!(
+        serialized.lines().count(),
+        1,
+        "serialized event result should not contain raw newlines"
+    );
     assert_eq!(got.structured_content, None);
     assert_eq!(got.meta, None);
     assert_eq!(got.is_error, Some(false));

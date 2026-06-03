@@ -108,3 +108,49 @@ fn mcp_tool_call_result_preserves_meta_in_jsonl_event() {
     );
     assert!(serialized["item"]["result"].get("meta").is_none());
 }
+
+#[test]
+fn large_multiline_mcp_result_serializes_as_single_jsonl_record() {
+    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+    let large_multiline_result = "sheet,row,value\n1,hello,world\n".repeat(200_000);
+
+    let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
+        codex_app_server_protocol::ItemCompletedNotification {
+            item: ThreadItem::McpToolCall {
+                id: "mcp-1".to_string(),
+                server: "google".to_string(),
+                tool: "read_sheet".to_string(),
+                status: McpToolCallStatus::Completed,
+                arguments: json!({"spreadsheet_id": "sheet-1"}),
+                mcp_app_resource_uri: None,
+                result: Some(Box::new(codex_app_server_protocol::McpToolCallResult {
+                    content: vec![json!({
+                        "type": "text",
+                        "text": large_multiline_result,
+                    })],
+                    structured_content: None,
+                    meta: None,
+                })),
+                error: None,
+                duration_ms: Some(42),
+            },
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+        },
+    ));
+
+    assert_eq!(collected.status, CodexStatus::Running);
+    assert_eq!(collected.events.len(), 1);
+
+    let jsonl_record =
+        serde_json::to_string(&collected.events[0]).expect("event should serialize as JSON");
+
+    assert_eq!(
+        jsonl_record.lines().count(),
+        1,
+        "JSONL event must not contain raw newlines"
+    );
+    assert!(jsonl_record.contains("\\n"));
+    serde_json::from_str::<serde_json::Value>(&jsonl_record).expect("JSONL record should parse");
+}
