@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::io::Write;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -813,16 +814,22 @@ fn truncate_mcp_tool_result_for_event(
         Ok(call_tool_result) => {
             // The app-server rebuilds `ThreadItem::McpToolCall` from this item,
             // so avoid persisting multi-megabyte results in rollout storage.
-            let Ok(serialized) = serde_json::to_string(call_tool_result) else {
-                return Ok(call_tool_result.clone());
+            let serialized = match serialize_json_preview(
+                call_tool_result,
+                MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES,
+            ) {
+                Ok(JsonSerializationPreview::Complete) => {
+                    return Ok(call_tool_result.clone());
+                }
+                Ok(JsonSerializationPreview::Truncated(preview)) => preview,
+                Err(_) => {
+                    return Ok(call_tool_result.clone());
+                }
             };
-            if serialized.len() <= MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES {
-                return Ok(call_tool_result.clone());
-            }
 
             // A huge MCP result can put bytes in `content`, `structuredContent`,
-            // or `_meta`. Collapse the event copy to a text preview of the whole
-            // serialized result so the UI still has useful context without
+            // or `_meta`. Collapse the event copy to a bounded serialized
+            // prefix preview so the UI still has useful context without
             // preserving a multi-megabyte structured payload.
             //
             // This budget applies to the preview text, not the final event JSON.
@@ -847,6 +854,66 @@ fn truncate_mcp_tool_result_for_event(
             message,
             TruncationPolicy::Bytes(MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES),
         )),
+    }
+}
+
+enum JsonSerializationPreview {
+    Complete,
+    Truncated(String),
+}
+
+fn serialize_json_preview<T: Serialize>(
+    value: &T,
+    max_bytes: usize,
+) -> Result<JsonSerializationPreview, serde_json::Error> {
+    let mut writer = JsonPreviewWriter::new(max_bytes.saturating_add(1));
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) if writer.bytes.len() <= max_bytes => Ok(JsonSerializationPreview::Complete),
+        Ok(()) => {
+            let preview = String::from_utf8_lossy(&writer.bytes).into_owned();
+            Ok(JsonSerializationPreview::Truncated(preview))
+        }
+        Err(_) if writer.truncated => {
+            let preview = String::from_utf8_lossy(&writer.bytes).into_owned();
+            Ok(JsonSerializationPreview::Truncated(preview))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+struct JsonPreviewWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    truncated: bool,
+}
+
+impl JsonPreviewWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes.min(8192)),
+            max_bytes,
+            truncated: false,
+        }
+    }
+}
+
+impl Write for JsonPreviewWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.max_bytes.saturating_sub(self.bytes.len());
+        if buffer.len() <= remaining {
+            self.bytes.extend_from_slice(buffer);
+            return Ok(buffer.len());
+        }
+
+        if remaining > 0 {
+            self.bytes.extend_from_slice(&buffer[..remaining]);
+        }
+        self.truncated = true;
+        Err(std::io::Error::other("JSON preview exceeded byte limit"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
