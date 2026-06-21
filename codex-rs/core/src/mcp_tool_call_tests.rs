@@ -984,10 +984,17 @@ fn truncate_mcp_tool_result_for_event_preserves_small_result() {
 
 #[test]
 fn truncate_mcp_tool_result_for_event_bounds_large_result() {
+    // A representative oversized result for https://github.com/openai/codex/issues/23131:
+    // XML-like markup, non-ASCII (Korean) labels, quotes, backslashes, and newlines.
+    let large_multiline_text = concat!(
+        "<frame name=\"쿠폰명 : {쿠폰정보1 쿠폰명}\" x=\"0\" y=\"0\">\n",
+        "  <text value=\"\\\"인용된\\\" 값 & <escaped>\" path=\"C:\\\\Users\\\\design\\\\figma.fig\" />\n",
+    )
+    .repeat(50_000);
     let original = CallToolResult {
         content: vec![serde_json::json!({
             "type": "text",
-            "text": "long-message-with-newlines-\n".repeat(200_000),
+            "text": large_multiline_text,
         })],
         structured_content: Some(serde_json::json!({
             "structured": "structured-value-".repeat(200_000),
@@ -1033,6 +1040,53 @@ fn truncate_mcp_tool_result_for_event_bounds_large_error() {
     // overhead beyond the requested byte budget.
     assert!(got.len() < MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES + 1024);
     assert!(got.contains("truncated"));
+}
+
+#[test]
+fn truncate_mcp_tool_result_for_event_collapses_multiple_content_blocks() {
+    // An oversized result can spread its bytes across several content blocks,
+    // including non-text ones. The event copy collapses all of them into a single
+    // bounded text preview regardless of block count or type.
+    let original = CallToolResult {
+        content: vec![
+            serde_json::json!({"type": "text", "text": "block-a-line-\n".repeat(100_000)}),
+            serde_json::json!({"type": "text", "text": "block-b-line-\n".repeat(100_000)}),
+            serde_json::json!({
+                "type": "image",
+                "data": "ABCD".repeat(100_000),
+                "mimeType": "image/png",
+            }),
+        ],
+        structured_content: None,
+        is_error: Some(false),
+        meta: None,
+    };
+
+    let got = truncate_mcp_tool_result_for_event(&Ok(original))
+        .expect("large multi-block result should remain successful");
+    let serialized = serde_json::to_string(&got).expect("truncated result should serialize");
+
+    assert_eq!(got.content.len(), 1, "content should collapse to one block");
+    assert_eq!(
+        got.content[0]
+            .get("type")
+            .and_then(serde_json::Value::as_str),
+        Some("text"),
+        "collapsed block should be a text preview"
+    );
+    assert!(serialized.len() < MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES * 2 + 1024);
+    assert_eq!(
+        serialized.lines().count(),
+        1,
+        "serialized event result should not contain raw newlines"
+    );
+    assert!(
+        got.content[0]
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| text.contains("truncated")),
+        "collapsed preview should carry a truncation marker: {got:?}"
+    );
 }
 
 #[tokio::test]

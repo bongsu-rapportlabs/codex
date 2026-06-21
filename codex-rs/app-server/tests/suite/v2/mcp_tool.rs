@@ -63,6 +63,13 @@ const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const TEST_SERVER_NAME: &str = "tool_server";
 const TEST_TOOL_NAME: &str = "echo_tool";
 const LARGE_RESPONSE_MESSAGE: &str = "large";
+// A multi-line block shaped like the Figma MCP result that triggered
+// https://github.com/openai/codex/issues/23131: XML-like markup, non-ASCII
+// (Korean) labels, quotes, backslashes, and embedded newlines.
+const LARGE_RESPONSE_BLOCK: &str = concat!(
+    "<frame name=\"쿠폰명 : {쿠폰정보1 쿠폰명}\" x=\"0\" y=\"0\">\n",
+    "  <text value=\"\\\"인용된\\\" 값 & <escaped>\" path=\"C:\\\\Users\\\\design\\\\figma.fig\" />\n",
+);
 const ELICITATION_TRIGGER_MESSAGE: &str = "confirm";
 const ELICITATION_MESSAGE: &str = "Allow this request?";
 const URL_ELICITATION_TRIGGER_MESSAGE: &str = "auth";
@@ -505,6 +512,13 @@ url = "{mcp_server_url}/mcp"
         .expect("truncated MCP event result should be represented as text content");
     assert!(text.contains("truncated"));
     assert!(text.len() < DEFAULT_OUTPUT_BYTES_CAP + 1024);
+    // The bounded preview keeps representative content from the real, Figma-shaped
+    // payload (non-ASCII labels and XML-like markup) rather than dropping it.
+    assert!(
+        text.contains("쿠폰명"),
+        "bounded preview should retain representative non-ASCII content"
+    );
+    assert!(text.contains("<frame"));
 
     let serialized_item = serde_json::to_string(&ThreadItem::McpToolCall {
         id,
@@ -518,6 +532,16 @@ url = "{mcp_server_url}/mcp"
         duration_ms: None,
     })?;
     assert!(serialized_item.len() < DEFAULT_OUTPUT_BYTES_CAP * 2 + 2048);
+    // The emitted event must be a single valid JSONL record: the multi-line MCP
+    // payload is collapsed and escaped, so no raw newline can split the record
+    // for a JSONL consumer such as the TypeScript SDK.
+    assert_eq!(
+        serialized_item.lines().count(),
+        1,
+        "emitted MCP event must not contain raw newlines"
+    );
+    serde_json::from_str::<serde_json::Value>(&serialized_item)
+        .expect("emitted MCP event should be valid JSON");
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -595,7 +619,8 @@ impl ServerHandler for ToolAppsMcpServer {
         meta.0.insert("calledBy".to_string(), json!("mcp-app"));
 
         if message == LARGE_RESPONSE_MESSAGE {
-            let large_text = "large-mcp-content-".repeat(DEFAULT_OUTPUT_BYTES_CAP / 8);
+            let repeats = DEFAULT_OUTPUT_BYTES_CAP / LARGE_RESPONSE_BLOCK.len() + 1;
+            let large_text = LARGE_RESPONSE_BLOCK.repeat(repeats);
             let mut result = CallToolResult::structured(json!({
                 "large": "structured-value-".repeat(DEFAULT_OUTPUT_BYTES_CAP / 8),
             }));
