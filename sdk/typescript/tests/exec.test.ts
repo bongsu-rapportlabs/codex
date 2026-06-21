@@ -68,6 +68,64 @@ describe("CodexExec", () => {
     }
   });
 
+  it("surfaces a truncated event stream instead of yielding a partial record", async () => {
+    // Regression for https://github.com/openai/codex/issues/23131: when the codex
+    // process is killed mid-write of a large event, stdout ends without a trailing
+    // newline. The consumer must NOT yield that partial record (which would make
+    // the caller JSON.parse a truncated line and report a confusing "Failed to
+    // parse item" that dumps the payload) — it must surface a clear diagnostic.
+    const { CodexExec } = await import("../src/exec");
+    spawnMock.mockClear();
+    const child = new FakeChildProcess();
+    spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
+
+    const completeRecord = JSON.stringify({
+      type: "item.completed",
+      item: { id: "item_1", type: "agent_message", text: "ok" },
+    });
+    // A large MCP event cut off mid-string (no trailing newline).
+    const partialRecord =
+      '{"type":"item.completed","item":{"id":"item_2","type":"mcp_tool_call",' +
+      '"server":"figma","tool":"get_metadata","result":{"content":[{"type":"text",' +
+      '"text":"<frame name=\\"쿠폰명 : {쿠폰정보1';
+
+    setImmediate(() => {
+      child.stdout.write(completeRecord + "\n");
+      child.stdout.write(partialRecord);
+      child.stdout.end();
+      child.stderr.end();
+      child.emit("exit", 1, null);
+    });
+
+    const exec = new CodexExec("codex");
+    const lines: string[] = [];
+    const run = (async () => {
+      for await (const line of exec.run({ input: "hi" })) {
+        lines.push(line);
+      }
+    })().then(
+      () => ({ status: "resolved" as const }),
+      (error: unknown) => ({ status: "rejected" as const, error }),
+    );
+
+    const result = await Promise.race([
+      run,
+      delay(500).then(() => ({ status: "timeout" as const })),
+    ]);
+
+    // Only the complete, newline-terminated record is yielded; the partial one is
+    // withheld and reported as an error.
+    expect(lines).toEqual([completeRecord]);
+    expect(result.status).toBe("rejected");
+    if (result.status === "rejected") {
+      const error = result.error as Error;
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toMatch(/mid-record|incomplete|unterminated/i);
+      // The diagnostic names the failure; it does not dump the truncated payload.
+      expect(error.message).not.toContain("쿠폰명");
+    }
+  });
+
   it("places resume args before image args", async () => {
     const { CodexExec } = await import("../src/exec");
     spawnMock.mockClear();

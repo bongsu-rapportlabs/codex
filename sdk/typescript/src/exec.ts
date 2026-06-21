@@ -1,6 +1,5 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
-import readline from "node:readline";
 import { createRequire } from "node:module";
 
 import type { CodexConfigObject, CodexConfigValue } from "./codexOptions";
@@ -196,26 +195,61 @@ export class CodexExec {
       },
     );
 
-    const rl = readline.createInterface({
-      input: child.stdout,
-      crlfDelay: Infinity,
-    });
+    // Split stdout into JSONL records ourselves rather than using `readline`.
+    // `readline` yields a trailing, newline-less buffer as if it were a complete
+    // line, so when the codex process is killed mid-write of a large event (e.g.
+    // an OOM kill while emitting a big MCP tool result), the consumer would try to
+    // `JSON.parse` a truncated record and fail with a confusing "Failed to parse
+    // item" that masks the real cause. Yielding only newline-terminated records
+    // lets us surface a truncated stream as a clear, bounded diagnostic instead.
+    child.stdout.setEncoding("utf8");
+    let pending = "";
 
     try {
-      for await (const line of rl) {
-        // `line` is a string (Node sets default encoding to utf8 for readline)
-        yield line as string;
+      for await (const chunk of child.stdout as AsyncIterable<string>) {
+        pending += chunk;
+        let newlineIndex = pending.indexOf("\n");
+        while (newlineIndex !== -1) {
+          let line = pending.slice(0, newlineIndex);
+          pending = pending.slice(newlineIndex + 1);
+          if (line.endsWith("\r")) {
+            line = line.slice(0, -1);
+          }
+          yield line;
+          newlineIndex = pending.indexOf("\n");
+        }
       }
 
       if (spawnError) throw spawnError;
+
       const { code, signal } = await exitPromise;
+      const trailing = pending.endsWith("\r") ? pending.slice(0, -1) : pending;
+      // A complete stream ends every event with a newline, so a non-empty
+      // trailing buffer means stdout was cut off in the middle of a record.
+      const incompleteRecordBytes = trailing.trim().length > 0 ? Buffer.byteLength(trailing) : 0;
+
       if (code !== 0 || signal) {
         const stderrBuffer = Buffer.concat(stderrChunks);
         const detail = signal ? `signal ${signal}` : `code ${code ?? 1}`;
-        throw new Error(`Codex Exec exited with ${detail}: ${stderrBuffer.toString("utf8")}`);
+        const truncatedNote = incompleteRecordBytes
+          ? ` The event stream ended mid-record with ${incompleteRecordBytes} unterminated bytes, so the final event was dropped.`
+          : "";
+        throw new Error(
+          `Codex Exec exited with ${detail}: ${stderrBuffer.toString("utf8")}${truncatedNote}`,
+        );
+      }
+
+      if (incompleteRecordBytes) {
+        // Clean exit but stdout ended without a trailing newline: the JSONL event
+        // stream was truncated mid-record. Report it explicitly rather than
+        // letting the caller JSON.parse a partial line and dump the payload.
+        throw new Error(
+          `Codex Exec produced an incomplete JSONL event: the stream ended mid-record with ` +
+            `${incompleteRecordBytes} unterminated bytes (the codex process likely exited while ` +
+            `writing a large event).`,
+        );
       }
     } finally {
-      rl.close();
       child.removeAllListeners();
       try {
         if (!child.killed) child.kill();
